@@ -35,7 +35,7 @@ func (w *Worker) Run(ctx context.Context, topic domain.Topic, syncConcurrency in
 	if syncConcurrency < 1 {
 		syncConcurrency = 1
 	}
-	if err := w.fetcher.Fetch(ctx, topic, syncConcurrency); err != nil {
+	if err := w.fetcher.Fetch(ctx, topic, syncConcurrency, topic.FetchMode); err != nil {
 		return fmt.Errorf("worker %d fetch topic %d: %w", w.id, topic.ID, err)
 	}
 	return nil

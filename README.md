@@ -83,9 +83,12 @@ webhost\bin\collyrobot-webhost.exe -addr :80 -backend http://127.0.0.1:8080
 - `POST /api/scheduler/stop`：停止调度器，并取消 API 触发的索引任务
 - `POST /api/scheduler/index`：异步触发索引工作流，返回 `202 Accepted`
 - `POST /api/scheduler/index/cancel`：中断当前索引任务，不停止 Worker 或移除已发现主题
-- `POST /api/scheduler/queue/waiting`：将所有 `waiting` 主题显式加入内存抓取队列
-- `POST /api/scheduler/retry/failed`：将所有 `failed` 主题恢复为 `waiting` 并加入内存队列
-- `GET /api/topics`：返回全部已索引主题，并按 `waiting`、`done`、`failed` 分组
+- `POST /api/scheduler/queue/waiting?mode=incremental`：将所有 `waiting` 主题按指定模式加入队列
+- `POST /api/scheduler/retry/failed?mode=validate`：恢复所有 `failed` 主题并按指定模式加入队列
+- `POST /api/scheduler/topics/:id/fetch?mode=reload`：按指定模式抓取单个 Topic，包括已完成主题
+- `GET /api/topics?status=done&page=1&page_size=20`：按状态分页返回 Topic，并附带各状态总数
+- `GET /api/topics/:id/contents`：按 PageNo、Floor、UID 排序返回前 20 条正文预览
+- `GET /api/topics/:id/contents/full`：按 PageNo、Floor、UID 排序并组合 Topic 的全部 Text
 - `PUT /api/scheduler/limits`：动态调整 Worker 上限和主题内并发上限
 
 调整调度上限示例：
@@ -135,8 +138,8 @@ internal/
 
 具体论坛的索引起始 URL、列表页主题解析和下一页选择器位于 `indexer/forum_rules_stub.go` 的 `ForumIndexRulesStub` 中。索引 Collector 限制在起始 URL 同一域名内访问，并使用 Colly 已访问 URL 记录避免分页链接循环。
 
-数据库只保存业务状态 `waiting`、`done` 与 `failed`，以及断点续爬的分页缓存；`queued`、`running` 等实时调度状态仅存在于进程内存。调度器服务启动后默认待命，不会自动加载 `waiting` 主题；只有收到显式抓取或重试指令时才会查询并放入内存队列。运行期间的领取、排队和去重均在内存中完成。这降低了 SQLite 写锁竞争，也避免依赖 `UPDATE ... RETURNING` 等特定数据库语法。当前内存队列面向单进程运行；未来横向扩容时可将该队列替换为 Redis Stream、NATS 或其他消息队列。
+数据库保存业务状态 `waiting`、`done` 与 `failed`，以及按 `Topic + UID` 唯一保存的正文；`queued`、`running` 等实时调度状态仅存在于进程内存。调度器服务启动后默认待命，不会自动加载 `waiting` 主题；只有收到显式抓取或重试指令时才会查询并放入内存队列。运行期间的领取、排队和去重均在内存中完成。这降低了 SQLite 写锁竞争，也避免依赖 `UPDATE ... RETURNING` 等特定数据库语法。当前内存队列面向单进程运行；未来横向扩容时可将该队列替换为 Redis Stream、NATS 或其他消息队列。
 
 主题正文抓取使用 Colly 编排：先同步访问“只看作者”首页以确认总页数，再创建异步 Collector，并将 `sync_concurrency` 映射为 Colly `LimitRule.Parallelism`。分页响应携带页码上下文，全部完成后按页码排序并调用持久化规则。具体论坛的 URL 拼接、HTML 选择器和小说存储规则位于 `worker/forum_rules_stub.go`，尚待按目标论坛实现。
 
-为支持断点续爬，SQLite 额外维护 `topic_page_content` 表。每个分页成功解析后立即将内容序列化写入该表；下次执行同一主题时，抓取器仍会访问首页确认最新总页数，但会跳过已经缓存的后续页面，仅请求缺失页。所有页面齐全后才调用正式小说持久化规则，因此任一页面失败时，已完成页面仍能保留供后续恢复使用。
+`PageContent.UID` 优先由论坛数据源提供；数据源无法提供时，抓取器使用 `Floor + PageNo` 生成 UID。SQLite 的 `topic_contents` 以 `(topic_id, uid)` 为主键，并保存正文 MD5。抓取支持三种模式：`incremental` 只插入新 UID；`validate` 同样插入新 UID，并在相同 UID 的正文 MD5 改变时覆盖 Text；`reload` 在网络抓取开始前删除该 Topic 的全部旧正文，然后重新写入本次结果。未传 `mode` 时默认使用 `incremental`。

@@ -19,7 +19,7 @@ func NewDemoTopicFetcher() *DemoTopicFetcher {
 }
 
 // Fetch 模拟正文分页抓取；不写入正式小说内容，避免演示数据污染真实内容存储。
-func (f *DemoTopicFetcher) Fetch(ctx context.Context, _ domain.Topic, syncConcurrency int) error {
+func (f *DemoTopicFetcher) Fetch(ctx context.Context, _ domain.Topic, syncConcurrency int, _ domain.FetchMode) error {
 	duration := f.TopicDuration
 	if duration <= 0 {
 		duration = 900 * time.Millisecond

@@ -48,9 +48,16 @@ func NewCollyForumFetcher(crawlerService *crawler.Service, rules ForumPageRules,
 }
 
 // Fetch 按“同步首页探测 -> 异步分页抓取 -> 页码排序 -> 最终持久化”执行一个主题。
-func (f *CollyForumFetcher) Fetch(ctx context.Context, topic domain.Topic, syncConcurrency int) error {
+func (f *CollyForumFetcher) Fetch(ctx context.Context, topic domain.Topic, syncConcurrency int, mode domain.FetchMode) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	parsedMode, err := domain.ParseFetchMode(string(mode))
+	if err != nil {
+		return err
+	}
+	if err := f.pages.PrepareFetch(ctx, topic.ID, parsedMode); err != nil {
+		return fmt.Errorf("prepare %s fetch: %w", parsedMode, err)
 	}
 	firstURL, err := f.rules.BuildAuthorPageURL(topic, 1)
 	if err != nil {
@@ -64,28 +71,18 @@ func (f *CollyForumFetcher) Fetch(ctx context.Context, topic domain.Topic, syncC
 		return fmt.Errorf("invalid total pages %d", firstPage.TotalPages)
 	}
 
-	// 先读取已有临时页。已缓存页面无需重复请求，服务重启后可从中断位置继续。
-	pages, err := f.pages.LoadPages(ctx, topic.ID)
-	if err != nil {
-		return fmt.Errorf("load cached pages: %w", err)
-	}
-	if _, exists := pages[1]; !exists {
-		if err := f.savePage(ctx, topic.ID, 1, firstPage.Contents); err != nil {
-			return err
-		}
-		pages[1] = normalizePageContents(1, firstPage.Contents)
-	}
+	pages := map[int][]domain.PageContent{1: normalizePageContents(1, firstPage.Contents)}
 	if err := f.fetchRemainingPages(ctx, topic, firstURL, firstPage.TotalPages, syncConcurrency, pages); err != nil {
 		return err
 	}
-	pages, err = f.pages.LoadPages(ctx, topic.ID)
-	if err != nil {
-		return fmt.Errorf("reload cached pages: %w", err)
-	}
 	if len(pages) != firstPage.TotalPages {
-		return fmt.Errorf("incomplete cached pages: expected %d, got %d", firstPage.TotalPages, len(pages))
+		return fmt.Errorf("incomplete pages: expected %d, got %d", firstPage.TotalPages, len(pages))
 	}
-	return f.rules.PersistNovel(ctx, topic, mergePagesInOrder(pages))
+	contents := mergePagesInOrder(pages)
+	if err := f.pages.SaveContents(ctx, topic.ID, parsedMode, contents); err != nil {
+		return fmt.Errorf("save topic contents: %w", err)
+	}
+	return f.rules.PersistNovel(ctx, topic, contents)
 }
 
 func (f *CollyForumFetcher) probeFirstPage(ctx context.Context, firstURL string) (FirstAuthorPage, error) {
@@ -115,7 +112,7 @@ func (f *CollyForumFetcher) probeFirstPage(ctx context.Context, firstURL string)
 	return firstPage, nil
 }
 
-func (f *CollyForumFetcher) fetchRemainingPages(ctx context.Context, topic domain.Topic, firstURL string, totalPages, syncConcurrency int, cachedPages map[int][]domain.PageContent) error {
+func (f *CollyForumFetcher) fetchRemainingPages(ctx context.Context, topic domain.Topic, firstURL string, totalPages, syncConcurrency int, pages map[int][]domain.PageContent) error {
 	parsedURL, err := url.Parse(firstURL)
 	if err != nil {
 		return fmt.Errorf("parse first author page url: %w", err)
@@ -130,9 +127,6 @@ func (f *CollyForumFetcher) fetchRemainingPages(ctx context.Context, topic domai
 
 	jobs := make([]pageJob, 0, totalPages-1)
 	for pageNo := 2; pageNo <= totalPages; pageNo++ {
-		if _, exists := cachedPages[pageNo]; exists {
-			continue
-		}
 		pageURL, err := f.rules.BuildAuthorPageURL(topic, pageNo)
 		if err != nil {
 			return fmt.Errorf("build author page %d url: %w", pageNo, err)
@@ -195,12 +189,7 @@ func (f *CollyForumFetcher) fetchRemainingPages(ctx context.Context, topic domai
 			}
 			continue
 		}
-		// 保存动作在结果到达时执行，而不是 Wait 之后统一写入；失败后已有页面可供续爬复用。
-		if err := f.savePage(ctx, topic.ID, result.pageNo, result.contents); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-		}
+		pages[result.pageNo] = result.contents
 	}
 	if firstErr != nil {
 		return firstErr
@@ -263,18 +252,13 @@ func pageNumberFromContext(ctx *colly.Context) int {
 	return pageNo
 }
 
-func (f *CollyForumFetcher) savePage(ctx context.Context, topicID int64, pageNo int, contents []domain.PageContent) error {
-	normalized := normalizePageContents(pageNo, contents)
-	// 页面已经收到完整 HTTP 响应后，即使上层正在停止，也尽量保留该页作为下次续爬断点。
-	if err := f.pages.SavePage(context.WithoutCancel(ctx), topicID, pageNo, normalized); err != nil {
-		return fmt.Errorf("save page %d: %w", pageNo, err)
-	}
-	return nil
-}
-
 func normalizePageContents(pageNo int, contents []domain.PageContent) []domain.PageContent {
 	for index := range contents {
 		contents[index].PageNo = pageNo
+		contents[index].UID = strings.TrimSpace(contents[index].UID)
+		if contents[index].UID == "" {
+			contents[index].UID = fmt.Sprintf("floor:%d/page:%d", contents[index].Floor, pageNo)
+		}
 	}
 	return contents
 }
@@ -286,10 +270,16 @@ func mergePagesInOrder(pages map[int][]domain.PageContent) []domain.PageContent 
 	}
 	sort.Ints(pageNumbers)
 	merged := make([]domain.PageContent, 0)
+	seen := make(map[string]struct{})
 	for _, pageNo := range pageNumbers {
 		contents := pages[pageNo]
-		// 同一页的规则实现必须保留 DOM 楼层顺序；Floor 仅用于后续额外校验和展示。
-		merged = append(merged, contents...)
+		for _, content := range contents {
+			if _, exists := seen[content.UID]; exists {
+				continue
+			}
+			seen[content.UID] = struct{}{}
+			merged = append(merged, content)
+		}
 	}
 	return merged
 }

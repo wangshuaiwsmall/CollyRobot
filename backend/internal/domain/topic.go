@@ -1,6 +1,10 @@
 package domain
 
-import "time"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
 
 // TopicStatus 描述一个主题在索引和抓取流水线中的状态。
 type TopicStatus string
@@ -15,6 +19,20 @@ const (
 	TopicFailed TopicStatus = "failed"
 )
 
+// ParseFetchMode 解析外部抓取模式；空值使用默认增量模式。
+func ParseFetchMode(value string) (FetchMode, error) {
+	mode := FetchMode(strings.ToLower(strings.TrimSpace(value)))
+	if mode == "" {
+		return FetchIncremental, nil
+	}
+	switch mode {
+	case FetchIncremental, FetchValidate, FetchReload:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("unsupported fetch mode %q", value)
+	}
+}
+
 // Topic 是索引模块与工作模块之间传递的标准主题记录。
 // ExternalID 使用论坛自身的主题编号，是跨多次索引任务去重的稳定键；ID 是本地数据库主键。
 type Topic struct {
@@ -27,12 +45,23 @@ type Topic struct {
 	LastError  string      `json:"last_error,omitempty"`
 	CreatedAt  time.Time   `json:"created_at"`
 	UpdatedAt  time.Time   `json:"updated_at"`
+	FetchMode  FetchMode   `json:"-"`
 }
 
+// FetchMode 决定同一 UID 的正文如何落库。
+type FetchMode string
+
+const (
+	FetchIncremental FetchMode = "incremental"
+	FetchValidate    FetchMode = "validate"
+	FetchReload      FetchMode = "reload"
+)
+
 // PageContent 是小说正文在单个论坛页面中解析出的一个楼层片段。
-// PageNo 与 Floor 用于在断点续爬或异步请求完成后恢复原始阅读顺序。
+// UID 由数据源提供；为空时抓取器使用 Floor + PageNo 生成同 Topic 内的身份。
 type PageContent struct {
 	PageNo int    `json:"page_no"`
+	UID    string `json:"uid"`
 	Floor  int    `json:"floor"`
 	Text   string `json:"text"`
 }

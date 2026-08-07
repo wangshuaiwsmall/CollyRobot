@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -231,25 +232,39 @@ func (s *Scheduler) Stop() {
 
 // QueueWaiting 将全部 waiting Topic 加入当前运行期的内存队列。
 // 已经 queued 或 running 的主题受 dispatched 去重保护，重复调用不会造成并发重复抓取。
-func (s *Scheduler) QueueWaiting(ctx context.Context) (int, error) {
+func (s *Scheduler) QueueWaiting(ctx context.Context, mode domain.FetchMode) (int, error) {
 	topics, err := s.repository.LoadWaiting(ctx)
 	if err != nil {
 		return 0, err
 	}
-	return s.enqueueTopics(topics), nil
+	return s.enqueueTopics(topics, mode), nil
 }
 
 // RetryFailed 将失败主题恢复为 waiting 后加入内存队列。它是显式重试操作，不会自动执行。
-func (s *Scheduler) RetryFailed(ctx context.Context) (int, error) {
+func (s *Scheduler) RetryFailed(ctx context.Context, mode domain.FetchMode) (int, error) {
 	topics, err := s.repository.RetryFailed(ctx)
 	if err != nil {
 		return 0, err
 	}
-	return s.enqueueTopics(topics), nil
+	return s.enqueueTopics(topics, mode), nil
+}
+
+// QueueTopic 将指定 Topic 以给定模式加入队列，允许对 done Topic 执行校验或重新拉取。
+func (s *Scheduler) QueueTopic(ctx context.Context, topicID int64, mode domain.FetchMode) (int, error) {
+	topics, err := s.repository.ListTopics(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for _, topic := range topics {
+		if topic.ID == topicID {
+			return s.enqueueTopics([]domain.Topic{topic}, mode), nil
+		}
+	}
+	return 0, fmt.Errorf("topic %d not found", topicID)
 }
 
 // enqueueTopics 维护运行期 queued/running 去重表，再将新任务放进 FIFO 队列。
-func (s *Scheduler) enqueueTopics(topics []domain.Topic) int {
+func (s *Scheduler) enqueueTopics(topics []domain.Topic, mode domain.FetchMode) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.running {
@@ -260,6 +275,7 @@ func (s *Scheduler) enqueueTopics(topics []domain.Topic) int {
 		if _, exists := s.dispatched[topic.ID]; exists {
 			continue
 		}
+		topic.FetchMode = mode
 		newTopics = append(newTopics, topic)
 		s.dispatched[topic.ID] = struct{}{}
 	}
@@ -347,7 +363,7 @@ func (s *Scheduler) runWorker(ctx context.Context, retire <-chan struct{}, insta
 		}
 		// 在任务边界读取最新配置，本主题整个处理期间保持该值不变。
 		concurrency := s.limits.Load().SyncConcurrency
-		s.crawlLogf("level=INFO event=topic_started worker_id=%d topic_id=%d concurrency=%d", instance.ID(), topic.ID, concurrency)
+		s.crawlLogf("level=INFO event=topic_started worker_id=%d topic_id=%d mode=%s concurrency=%d", instance.ID(), topic.ID, topic.FetchMode, concurrency)
 		if err := instance.Run(ctx, topic, concurrency); err != nil {
 			s.releaseTopic(topic.ID)
 			if ctx.Err() != nil {

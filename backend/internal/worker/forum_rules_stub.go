@@ -30,7 +30,8 @@ func (ForumPageRulesStub) ParseFirstAuthorPage(_ *colly.Response) (FirstAuthorPa
 func (ForumPageRulesStub) ParseAuthorPage(_ *colly.Response) ([]domain.PageContent, error) {
 	// TODO(forum-adapter)：
 	// 1. 定位“只看作者”结果中的每个正文楼层。
-	// 2. 清理引用、签名、广告和无关 HTML，保留正文文本与 Floor。
+	// 2. 清理引用、签名、广告和无关 HTML，保留正文文本、Floor 和数据源 UID。
+	//    数据源没有 UID 时可留空，抓取器会用 Floor + PageNo 生成。
 	// 3. 必须按 DOM 中的楼层顺序返回内容。
 	return nil, ErrForumRulesNotImplemented
 }

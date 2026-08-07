@@ -2,8 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/md5"
 	"database/sql"
-	"encoding/json"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -62,15 +63,19 @@ func migrate(db *sql.DB) error {
 			updated_at INTEGER NOT NULL
 		);
 		CREATE INDEX IF NOT EXISTS idx_topics_status_id ON topics(status, id);
-		CREATE TABLE IF NOT EXISTS topic_page_content (
+		CREATE TABLE IF NOT EXISTS topic_contents (
 			topic_id INTEGER NOT NULL,
+			uid TEXT NOT NULL,
 			page_no INTEGER NOT NULL,
-			contents_json TEXT NOT NULL,
+			floor INTEGER NOT NULL,
+			text TEXT NOT NULL,
+			text_md5 TEXT NOT NULL,
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL,
-			PRIMARY KEY (topic_id, page_no)
+			PRIMARY KEY (topic_id, uid)
 		);
-	CREATE INDEX IF NOT EXISTS idx_topic_page_content_topic_page ON topic_page_content(topic_id, page_no);
+		CREATE INDEX IF NOT EXISTS idx_topic_contents_order ON topic_contents(topic_id, page_no, floor);
+		DROP TABLE IF EXISTS topic_page_content;
 		CREATE TABLE IF NOT EXISTS app_settings (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL,
@@ -203,58 +208,60 @@ func (s *TopicStore) RetryFailed(ctx context.Context) ([]domain.Topic, error) {
 	return topics, nil
 }
 
-// LoadPages 返回主题已经缓存的全部论坛页。
-// 这是启动断点续爬时唯一需要读取的正文缓存，不参与高频任务分配。
-func (s *TopicStore) LoadPages(ctx context.Context, topicID int64) (map[int][]domain.PageContent, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT page_no, contents_json FROM topic_page_content WHERE topic_id = ? ORDER BY page_no`, topicID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	pages := make(map[int][]domain.PageContent)
-	for rows.Next() {
-		var pageNo int
-		var encoded string
-		if err := rows.Scan(&pageNo, &encoded); err != nil {
-			return nil, err
-		}
-		var contents []domain.PageContent
-		if err := json.Unmarshal([]byte(encoded), &contents); err != nil {
-			return nil, fmt.Errorf("decode cached page %d: %w", pageNo, err)
-		}
-		pages[pageNo] = contents
-	}
-	return pages, rows.Err()
-}
-
-// SavePage 立即持久化单页抓取结果。先 UPDATE、再按需 INSERT，
-// 只依赖常见 SQL 语句，不需要特定数据库的 UPSERT 语法。
-func (s *TopicStore) SavePage(ctx context.Context, topicID int64, pageNo int, contents []domain.PageContent) error {
-	encoded, err := json.Marshal(contents)
-	if err != nil {
-		return fmt.Errorf("encode page %d: %w", pageNo, err)
-	}
-	now := time.Now().Unix()
-	result, err := s.db.ExecContext(ctx,
-		`UPDATE topic_page_content SET contents_json = ?, updated_at = ? WHERE topic_id = ? AND page_no = ?`,
-		string(encoded), now, topicID, pageNo,
-	)
-	if err != nil {
-		return err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected > 0 {
+// PrepareFetch 在重新拉取模式下先删除该 Topic 的全部正文。
+func (s *TopicStore) PrepareFetch(ctx context.Context, topicID int64, mode domain.FetchMode) error {
+	if mode != domain.FetchReload {
 		return nil
 	}
-	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO topic_page_content(topic_id, page_no, contents_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
-		topicID, pageNo, string(encoded), now, now,
-	)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM topic_contents WHERE topic_id = ?`, topicID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// SaveContents 以 topic_id + uid 为唯一键保存正文。
+func (s *TopicStore) SaveContents(ctx context.Context, topicID int64, mode domain.FetchMode, contents []domain.PageContent) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().Unix()
+	for _, content := range contents {
+		if content.UID == "" {
+			return fmt.Errorf("page %d floor %d has empty uid", content.PageNo, content.Floor)
+		}
+		hash := md5.Sum([]byte(content.Text))
+		textMD5 := hex.EncodeToString(hash[:])
+		result, err := tx.ExecContext(ctx, `
+			INSERT OR IGNORE INTO topic_contents(topic_id, uid, page_no, floor, text, text_md5, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			topicID, content.UID, content.PageNo, content.Floor, content.Text, textMD5, now, now)
+		if err != nil {
+			return err
+		}
+		inserted, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if inserted > 0 || mode != domain.FetchValidate {
+			continue
+		}
+		// 校验模式只在正文 MD5 变化时覆盖内容；UID 相同即视为同一 PageContent。
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE topic_contents
+			SET page_no = ?, floor = ?, text = ?, text_md5 = ?, updated_at = ?
+			WHERE topic_id = ? AND uid = ? AND text_md5 <> ?`,
+			content.PageNo, content.Floor, content.Text, textMD5, now, topicID, content.UID, textMD5); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // MarkDone 清空历史错误并把主题置为完成状态。

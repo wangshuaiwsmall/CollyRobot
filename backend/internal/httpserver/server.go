@@ -56,7 +56,10 @@ func New(cfg config.Config, db *sql.DB, dispatcher *scheduler.Scheduler, logs *a
 	api.POST("/scheduler/index/cancel", s.cancelIndex)
 	api.POST("/scheduler/queue/waiting", s.queueWaiting)
 	api.POST("/scheduler/retry/failed", s.retryFailed)
+	api.POST("/scheduler/topics/:id/fetch", s.fetchTopic)
 	api.GET("/topics", s.listTopics)
+	api.GET("/topics/:id/contents", s.topicContents)
+	api.GET("/topics/:id/contents/full", s.fullTopicContent)
 	api.PUT("/scheduler/limits", s.updateSchedulerLimits)
 	api.GET("/settings/proxy", s.proxyStatus)
 	api.PUT("/settings/proxy", s.updateProxy)
@@ -165,22 +168,56 @@ func (s *Server) startScheduler(c *gin.Context) {
 
 // queueWaiting 按用户指令将全部 waiting Topic 放入内存队列，不会重复派发正在处理的主题。
 func (s *Server) queueWaiting(c *gin.Context) {
-	queued, err := s.scheduler.QueueWaiting(c.Request.Context())
+	mode, err := domain.ParseFetchMode(c.Query("mode"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	queued, err := s.scheduler.QueueWaiting(c.Request.Context(), mode)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"queued": queued, "status": s.scheduler.Status()})
+	c.JSON(http.StatusOK, gin.H{"queued": queued, "mode": mode, "status": s.scheduler.Status()})
 }
 
 // retryFailed 显式重试失败主题：先恢复为 waiting，再加入内存队列。
 func (s *Server) retryFailed(c *gin.Context) {
-	queued, err := s.scheduler.RetryFailed(c.Request.Context())
+	mode, err := domain.ParseFetchMode(c.Query("mode"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	queued, err := s.scheduler.RetryFailed(c.Request.Context(), mode)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"queued": queued, "status": s.scheduler.Status()})
+	c.JSON(http.StatusOK, gin.H{"queued": queued, "mode": mode, "status": s.scheduler.Status()})
+}
+
+// fetchTopic 允许对任意状态的单个 Topic 执行增量、校验或重新拉取。
+func (s *Server) fetchTopic(c *gin.Context) {
+	topicID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || topicID < 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "topic id must be a positive integer"})
+		return
+	}
+	mode, err := domain.ParseFetchMode(c.Query("mode"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	queued, err := s.scheduler.QueueTopic(c.Request.Context(), topicID, mode)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	if queued == 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": "topic is already queued or running"})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"queued": queued, "topic_id": topicID, "mode": mode, "status": s.scheduler.Status()})
 }
 
 // stopScheduler 停止 Worker 并取消通过 API 触发的索引任务。
@@ -208,31 +245,172 @@ func (s *Server) cancelIndex(c *gin.Context) {
 	c.JSON(http.StatusOK, s.scheduler.Status())
 }
 
-type topicGroups struct {
-	Waiting []domain.Topic `json:"waiting"`
-	Done    []domain.Topic `json:"done"`
-	Failed  []domain.Topic `json:"failed"`
+type topicCounts struct {
+	Waiting int `json:"waiting"`
+	Done    int `json:"done"`
+	Failed  int `json:"failed"`
 }
 
-// listTopics 以持久化业务状态分组返回全部已索引 Topic；queued/running 是内存状态，不改变分组。
+// listTopics 只返回指定状态的当前页，并附带各状态总数，避免大量 Topic 一次传给浏览器。
 func (s *Server) listTopics(c *gin.Context) {
-	topics, err := s.scheduler.Topics(c.Request.Context())
+	status := domain.TopicStatus(strings.ToLower(strings.TrimSpace(c.DefaultQuery("status", string(domain.TopicWaiting)))))
+	if status != domain.TopicWaiting && status != domain.TopicDone && status != domain.TopicFailed {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "status must be waiting, done or failed"})
+		return
+	}
+	page, err := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if err != nil || page < 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "page must be a positive integer"})
+		return
+	}
+	pageSize, err := strconv.Atoi(c.DefaultQuery("page_size", "10"))
+	if err != nil || pageSize < 1 || pageSize > 100 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "page_size must be between 1 and 100"})
+		return
+	}
+	counts := topicCounts{}
+	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT status, COUNT(*) FROM topics GROUP BY status`)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	groups := topicGroups{Waiting: make([]domain.Topic, 0), Done: make([]domain.Topic, 0), Failed: make([]domain.Topic, 0)}
-	for _, topic := range topics {
-		switch topic.Status {
-		case "done":
-			groups.Done = append(groups.Done, topic)
-		case "failed":
-			groups.Failed = append(groups.Failed, topic)
+	for rows.Next() {
+		var rowStatus domain.TopicStatus
+		var count int
+		if err := rows.Scan(&rowStatus, &count); err != nil {
+			rows.Close()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		switch rowStatus {
+		case domain.TopicDone:
+			counts.Done = count
+		case domain.TopicFailed:
+			counts.Failed = count
 		default:
-			groups.Waiting = append(groups.Waiting, topic)
+			counts.Waiting += count
 		}
 	}
-	c.JSON(http.StatusOK, groups)
+	if err := rows.Close(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	total := counts.Waiting
+	if status == domain.TopicDone {
+		total = counts.Done
+	} else if status == domain.TopicFailed {
+		total = counts.Failed
+	}
+	totalPages := max(1, (total+pageSize-1)/pageSize)
+	if page > totalPages {
+		page = totalPages
+	}
+	topicRows, err := s.db.QueryContext(c.Request.Context(), `
+		SELECT id, external_id, title, author_id, url, status, last_error, created_at, updated_at
+		FROM topics WHERE status = ? ORDER BY id LIMIT ? OFFSET ?`, status, pageSize, (page-1)*pageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer topicRows.Close()
+	items := make([]domain.Topic, 0, pageSize)
+	for topicRows.Next() {
+		var topic domain.Topic
+		var createdAt, updatedAt int64
+		if err := topicRows.Scan(&topic.ID, &topic.ExternalID, &topic.Title, &topic.AuthorID, &topic.URL,
+			&topic.Status, &topic.LastError, &createdAt, &updatedAt); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		topic.CreatedAt = time.Unix(createdAt, 0)
+		topic.UpdatedAt = time.Unix(updatedAt, 0)
+		items = append(items, topic)
+	}
+	if err := topicRows.Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"items": items, "counts": counts, "page": page, "page_size": pageSize,
+		"total": total, "total_pages": totalPages,
+	})
+}
+
+const topicContentPreviewLimit = 20
+
+// topicContents 只返回正文预览，避免打开详情时传输整个 Topic。
+func (s *Server) topicContents(c *gin.Context) {
+	topicID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || topicID < 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "topic id must be a positive integer"})
+		return
+	}
+	var total int
+	if err := s.db.QueryRowContext(c.Request.Context(),
+		`SELECT COUNT(*) FROM topic_contents WHERE topic_id = ?`, topicID).Scan(&total); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	rows, err := s.db.QueryContext(c.Request.Context(), `
+		SELECT uid, page_no, floor, text
+		FROM topic_contents
+		WHERE topic_id = ?
+		ORDER BY page_no, floor, uid
+		LIMIT ?`, topicID, topicContentPreviewLimit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	contents := make([]domain.PageContent, 0)
+	for rows.Next() {
+		var content domain.PageContent
+		if err := rows.Scan(&content.UID, &content.PageNo, &content.Floor, &content.Text); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		contents = append(contents, content)
+	}
+	if err := rows.Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"topic_id": topicID, "contents": contents, "total": total,
+		"displayed": len(contents), "truncated": total > len(contents),
+	})
+}
+
+// fullTopicContent 按页码、楼层和 UID 排序后拼接全部 Text，供阅读完整内容。
+func (s *Server) fullTopicContent(c *gin.Context) {
+	topicID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || topicID < 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "topic id must be a positive integer"})
+		return
+	}
+	rows, err := s.db.QueryContext(c.Request.Context(), `
+		SELECT text FROM topic_contents
+		WHERE topic_id = ?
+		ORDER BY page_no, floor, uid`, topicID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	parts := make([]string, 0)
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		parts = append(parts, value)
+	}
+	if err := rows.Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"topic_id": topicID, "content_count": len(parts), "text": strings.Join(parts, "\n\n")})
 }
 
 // schedulerStatus 返回并发上限、Worker 数量及累计处理统计。

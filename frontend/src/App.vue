@@ -20,6 +20,7 @@ interface SchedulerStatus {
 
 type ProxyMode = 'direct' | 'system' | 'manual'
 type LogStream = 'indexer' | 'crawler'
+type FetchMode = 'incremental' | 'validate' | 'reload'
 
 interface LogTailResponse {
   stream: LogStream
@@ -39,10 +40,26 @@ interface Topic {
   updated_at: string
 }
 
-interface TopicGroups {
-  waiting: Topic[]
-  done: Topic[]
-  failed: Topic[]
+interface TopicCounts {
+  waiting: number
+  done: number
+  failed: number
+}
+
+interface TopicPageResponse {
+  items: Topic[]
+  counts: TopicCounts
+  page: number
+  page_size: number
+  total: number
+  total_pages: number
+}
+
+interface PageContent {
+  uid: string
+  page_no: number
+  floor: number
+  text: string
 }
 
 interface ProxyStatus {
@@ -82,9 +99,24 @@ const logEntries = ref<string[]>([])
 const logLoading = ref(false)
 const logError = ref('')
 const logRefreshedAt = ref('')
-const topicGroups = ref<TopicGroups>({ waiting: [], done: [], failed: [] })
+const topicItems = ref<Topic[]>([])
+const topicCounts = ref<TopicCounts>({ waiting: 0, done: 0, failed: 0 })
+const topicTotal = ref(0)
+const topicTotalPages = ref(1)
 const topicsLoading = ref(false)
 const activeTopicStatus = ref<TopicStatus>('waiting')
+const topicPageSize = ref(10)
+const topicPages = ref<Record<TopicStatus, number>>({ waiting: 1, done: 1, failed: 1 })
+const selectedTopic = ref<Topic | null>(null)
+const selectedTopicContents = ref<PageContent[]>([])
+const selectedTopicContentTotal = ref(0)
+const topicDetailsLoading = ref(false)
+const topicDetailsError = ref('')
+const fullTopicText = ref('')
+const fullTopicLoading = ref(false)
+const fullTopicError = ref('')
+const readingFullTopic = ref(false)
+const fetchMode = ref<FetchMode>('incremental')
 let logRefreshTimer: number | undefined
 let statusRefreshTimer: number | undefined
 const scheduler = ref<SchedulerStatus>({
@@ -105,11 +137,86 @@ const completionRate = computed(() => {
 })
 const schedulerState = computed(() => (scheduler.value.running ? '运行中' : '已停止'))
 const topicSections = computed(() => [
-  { key: 'waiting' as const, label: '等待抓取', description: '已完成索引，等待抓取指令', topics: topicGroups.value.waiting },
-  { key: 'done' as const, label: '已完成', description: '正文已完整持久化', topics: topicGroups.value.done },
-  { key: 'failed' as const, label: '抓取失败', description: '可在抓取任务页重试', topics: topicGroups.value.failed },
+  { key: 'waiting' as const, label: '等待抓取', description: '已完成索引，等待抓取指令', count: topicCounts.value.waiting },
+  { key: 'done' as const, label: '已完成', description: '正文已完整持久化', count: topicCounts.value.done },
+  { key: 'failed' as const, label: '抓取失败', description: '可在抓取任务页重试', count: topicCounts.value.failed },
 ])
 const activeTopicSection = computed(() => topicSections.value.find((section) => section.key === activeTopicStatus.value) ?? topicSections.value[0])
+const activeTopicPageCount = computed(() => topicTotalPages.value)
+const activeTopicPage = computed(() => topicPages.value[activeTopicStatus.value])
+const activeTopicRange = computed(() => {
+  if (topicTotal.value === 0) return '0–0'
+  const start = (activeTopicPage.value - 1) * topicPageSize.value + 1
+  const end = Math.min(start + topicItems.value.length - 1, topicTotal.value)
+  return `${start}–${end}`
+})
+
+function selectTopicStatus(status: TopicStatus) {
+  activeTopicStatus.value = status
+  void loadTopics()
+}
+
+function changeTopicPage(page: number) {
+  topicPages.value[activeTopicStatus.value] = Math.min(Math.max(1, page), activeTopicPageCount.value)
+  void loadTopics()
+}
+
+function changeTopicPageSize() {
+  topicPages.value = { waiting: 1, done: 1, failed: 1 }
+  void loadTopics()
+}
+
+async function viewTopic(topic: Topic) {
+  selectedTopic.value = topic
+  selectedTopicContents.value = []
+  selectedTopicContentTotal.value = 0
+  topicDetailsError.value = ''
+  readingFullTopic.value = false
+  fullTopicText.value = ''
+  fullTopicError.value = ''
+  topicDetailsLoading.value = true
+  try {
+    const result = await request<{ topic_id: number; contents: PageContent[]; total: number }>(`/api/topics/${topic.id}/contents`)
+    selectedTopicContents.value = result.contents
+    selectedTopicContentTotal.value = result.total
+  } catch (reason) {
+    topicDetailsError.value = reason instanceof Error ? reason.message : '读取主题正文失败'
+    logger.error('读取主题正文失败', { topicId: topic.id, reason })
+  } finally {
+    topicDetailsLoading.value = false
+  }
+}
+
+async function readFullTopic() {
+  if (!selectedTopic.value) return
+  readingFullTopic.value = true
+  fullTopicText.value = ''
+  fullTopicError.value = ''
+  fullTopicLoading.value = true
+  try {
+    const result = await request<{ topic_id: number; content_count: number; text: string }>(`/api/topics/${selectedTopic.value.id}/contents/full`)
+    fullTopicText.value = result.text
+  } catch (reason) {
+    fullTopicError.value = reason instanceof Error ? reason.message : '读取完整内容失败'
+    logger.error('读取完整主题正文失败', { topicId: selectedTopic.value.id, reason })
+  } finally {
+    fullTopicLoading.value = false
+  }
+}
+
+function showTopicPreview() {
+  readingFullTopic.value = false
+}
+
+function closeTopicDetails() {
+  selectedTopic.value = null
+  selectedTopicContents.value = []
+  selectedTopicContentTotal.value = 0
+  topicDetailsError.value = ''
+  readingFullTopic.value = false
+  fullTopicText.value = ''
+  fullTopicError.value = ''
+}
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, options)
@@ -180,22 +287,41 @@ async function queueTopics(mode: 'waiting' | 'failed') {
   actionMessage.value = ''
   try {
     const path = mode === 'waiting' ? 'queue/waiting' : 'retry/failed'
-    const result = await request<{ queued: number; status: SchedulerStatus }>(`/api/scheduler/${path}`, { method: 'POST' })
+    const result = await request<{ queued: number; status: SchedulerStatus }>(`/api/scheduler/${path}?mode=${fetchMode.value}`, { method: 'POST' })
     scheduler.value = result.status
     actionMessage.value = mode === 'waiting'
       ? `已将 ${result.queued} 个等待主题加入抓取队列`
       : `已将 ${result.queued} 个失败主题恢复并加入抓取队列`
-    logger.info('主题抓取指令已提交', { mode, queued: result.queued })
+    logger.info('主题抓取指令已提交', { source: mode, fetchMode: fetchMode.value, queued: result.queued })
   } catch (reason) {
     actionMessage.value = reason instanceof Error ? reason.message : '提交抓取指令失败'
     logger.error('主题抓取指令失败', { mode, reason })
   }
 }
 
+async function fetchTopic(topic: Topic, mode: FetchMode) {
+	actionMessage.value = ''
+	try {
+		const result = await request<{ queued: number; status: SchedulerStatus }>(`/api/scheduler/topics/${topic.id}/fetch?mode=${mode}`, { method: 'POST' })
+		scheduler.value = result.status
+		actionMessage.value = `主题“${topic.title}”已按 ${mode} 模式加入队列`
+		logger.info('单主题抓取指令已提交', { topicId: topic.id, fetchMode: mode })
+	} catch (reason) {
+		actionMessage.value = reason instanceof Error ? reason.message : '提交单主题抓取失败'
+		logger.error('单主题抓取指令失败', { topicId: topic.id, fetchMode: mode, reason })
+	}
+}
+
 async function loadTopics() {
   topicsLoading.value = true
   try {
-    topicGroups.value = await request<TopicGroups>('/api/topics')
+    const status = activeTopicStatus.value
+    const result = await request<TopicPageResponse>(`/api/topics?status=${status}&page=${topicPages.value[status]}&page_size=${topicPageSize.value}`)
+    topicItems.value = result.items
+    topicCounts.value = result.counts
+    topicTotal.value = result.total
+    topicTotalPages.value = result.total_pages
+    topicPages.value[status] = result.page
   } catch (reason) {
     logger.error('读取索引主题失败', { reason })
   } finally {
@@ -352,7 +478,7 @@ onUnmounted(() => {
           <div>
             <p class="eyebrow">CRAWLER OPERATIONS</p>
             <h2>把论坛内容采集<br />变成一条可控的流水线。</h2>
-            <p class="hero-copy">索引、调度、分页抓取与断点续爬状态，都在一个工作台中掌握。</p>
+            <p class="hero-copy">索引、调度、分页抓取与 UID 增量更新状态，都在一个工作台中掌握。</p>
           </div>
           <div class="hero-orbit" aria-hidden="true">
             <span class="orbit-ring ring-one"></span><span class="orbit-ring ring-two"></span>
@@ -376,7 +502,7 @@ onUnmounted(() => {
               <div class="pipeline-line"></div>
               <div class="pipeline-step"><span>02</span><div><strong>内存队列</strong><small>已缓存 {{ scheduler.queued }} 个待抓取主题</small></div><b>队列</b></div>
               <div class="pipeline-line"></div>
-              <div class="pipeline-step"><span>03</span><div><strong>内容抓取</strong><small>Colly 分页并发与断点续爬</small></div><b>{{ scheduler.active_workers }} Worker</b></div>
+              <div class="pipeline-step"><span>03</span><div><strong>内容抓取</strong><small>Colly 分页并发与 UID 去重</small></div><b>{{ scheduler.active_workers }} Worker</b></div>
             </div>
           </article>
           <article class="panel summary-panel">
@@ -390,20 +516,20 @@ onUnmounted(() => {
       <section v-else-if="activePage === 'indexer'" class="page">
         <div class="section-intro"><p class="eyebrow">INDEX PIPELINE</p><h2>{{ scheduler.indexing ? '索引中' : '空闲中' }}</h2><p>{{ scheduler.indexing ? '正在按列表页构建主题索引；已发现的主题会持续保存为“等待抓取”。' : '索引器当前空闲。开始索引后，发现的新主题将保存为“等待抓取”，由抓取任务页显式入队。' }}</p></div>
         <div class="index-actions"><button class="primary-button" type="button" :disabled="scheduler.indexing || !scheduler.running" @click="controlIndex('start')">开始索引</button><button class="secondary-button" type="button" :disabled="!scheduler.indexing" @click="controlIndex('cancel')">中断索引</button></div>
-        <div v-if="topicsLoading && topicSections.every((section) => section.topics.length === 0)" class="settings-loading">正在读取已索引主题…</div>
+        <div v-if="topicsLoading && topicItems.length === 0" class="settings-loading">正在读取已索引主题…</div>
         <article v-else class="panel topic-group" :class="activeTopicSection.key">
           <div class="topic-tabs" role="tablist" aria-label="主题状态">
-            <button v-for="section in topicSections" :key="section.key" class="topic-tab" :class="{ active: activeTopicStatus === section.key }" type="button" role="tab" :aria-selected="activeTopicStatus === section.key" @click="activeTopicStatus = section.key">{{ section.label }} <b>{{ section.topics.length }}</b></button>
+            <button v-for="section in topicSections" :key="section.key" class="topic-tab" :class="{ active: activeTopicStatus === section.key }" type="button" role="tab" :aria-selected="activeTopicStatus === section.key" @click="selectTopicStatus(section.key)">{{ section.label }} <b>{{ section.count }}</b></button>
           </div>
-          <div class="panel-heading topic-group-heading"><div><h3>{{ activeTopicSection.label }}</h3><p>{{ activeTopicSection.description }}</p></div><b>{{ activeTopicSection.topics.length }}</b></div>
-          <div v-if="activeTopicSection.topics.length === 0" class="topic-empty">暂无主题</div>
-          <div v-else class="topic-list"><div v-for="topic in activeTopicSection.topics" :key="topic.id" class="topic-item"><div><strong>{{ topic.title }}</strong><small>#{{ topic.external_id }} · {{ topic.author_id }}</small><small v-if="topic.last_error" class="topic-error">{{ topic.last_error }}</small></div><a :href="topic.url" target="_blank" rel="noreferrer">查看主题</a></div></div>
+          <div class="panel-heading topic-group-heading"><div><h3>{{ activeTopicSection.label }}</h3><p>{{ activeTopicSection.description }}</p></div><b>{{ activeTopicSection.count }}</b></div>
+          <div v-if="topicTotal === 0" class="topic-empty">暂无主题</div>
+          <template v-else><div class="topic-list"><div v-for="topic in topicItems" :key="topic.id" class="topic-item"><div><strong>{{ topic.title }}</strong><small>#{{ topic.external_id }} · {{ topic.author_id }}</small><small v-if="topic.last_error" class="topic-error">{{ topic.last_error }}</small></div><div class="topic-actions"><template v-if="activeTopicSection.key === 'done'"><button class="topic-fetch-button incremental" type="button" :disabled="!scheduler.running" @click="fetchTopic(topic, 'incremental')">增量抓取</button><button class="topic-fetch-button validate" type="button" :disabled="!scheduler.running" @click="fetchTopic(topic, 'validate')">校验抓取</button><button class="topic-fetch-button reload" type="button" :disabled="!scheduler.running" @click="fetchTopic(topic, 'reload')">重新拉取</button></template><button class="view-topic-button" type="button" @click="viewTopic(topic)">查看主题</button></div></div></div><div class="topic-pagination"><span>显示 {{ activeTopicRange }}，共 {{ topicTotal }} 条</span><label>每页<select v-model.number="topicPageSize" @change="changeTopicPageSize"><option :value="10">10</option><option :value="20">20</option><option :value="50">50</option><option :value="100">100</option></select>条</label><div class="pagination-buttons"><button type="button" :disabled="activeTopicPage <= 1 || topicsLoading" @click="changeTopicPage(activeTopicPage - 1)">上一页</button><b>{{ activeTopicPage }} / {{ activeTopicPageCount }}</b><button type="button" :disabled="activeTopicPage >= activeTopicPageCount || topicsLoading" @click="changeTopicPage(activeTopicPage + 1)">下一页</button></div></div></template>
         </article>
       </section>
 
       <section v-else-if="activePage === 'tasks'" class="page">
-        <div class="section-intro"><p class="eyebrow">TOPIC WORKERS</p><h2>抓取任务</h2><p>索引主题先以“等待抓取”持久化；点击下方操作后才进入内存队列，由 Worker 处理并支持断点续爬。</p></div>
-        <article class="panel table-panel"><div class="panel-heading"><h3>抓取操作</h3><div class="button-row task-actions"><button class="primary-button" type="button" :disabled="!scheduler.running" @click="queueTopics('waiting')">开始抓取等待项</button><button class="secondary-button" type="button" :disabled="!scheduler.running" @click="queueTopics('failed')">重试失败项</button></div></div><div class="task-table-header"><span>主题</span><span>状态</span><span>进度</span><span>更新时间</span></div><div class="task-row"><span><b>等待抓取主题</b><small>通过“开始抓取等待项”显式加入队列</small></span><span><i class="status-chip queued">队列 {{ scheduler.queued }}</i></span><span><div class="progress-track"><i :style="{ width: `${Math.min(scheduler.queued * 8, 100)}%` }"></i></div></span><span>运行期</span></div></article>
+        <div class="section-intro"><p class="eyebrow">TOPIC WORKERS</p><h2>抓取任务</h2><p>正文按 Topic + UID 去重，可选择增量、校验更新或完全重新拉取。</p></div>
+        <article class="panel table-panel"><div class="panel-heading"><h3>抓取操作</h3><div class="button-row task-actions"><label class="task-mode">抓取模式<select v-model="fetchMode"><option value="incremental">默认 · 仅增量</option><option value="validate">校验 · 更新变动正文</option><option value="reload">重新拉取 · 先删除旧正文</option></select></label><button class="primary-button" type="button" :disabled="!scheduler.running" @click="queueTopics('waiting')">开始抓取等待项</button><button class="secondary-button" type="button" :disabled="!scheduler.running" @click="queueTopics('failed')">重试失败项</button></div></div><div class="task-table-header"><span>主题</span><span>状态</span><span>进度</span><span>更新时间</span></div><div class="task-row"><span><b>等待抓取主题</b><small>使用当前抓取模式加入队列</small></span><span><i class="status-chip queued">队列 {{ scheduler.queued }}</i></span><span><div class="progress-track"><i :style="{ width: `${Math.min(scheduler.queued * 8, 100)}%` }"></i></div></span><span>运行期</span></div></article>
       </section>
 
       <section v-else-if="activePage === 'logs'" class="page">
@@ -480,5 +606,14 @@ onUnmounted(() => {
         </article>
       </section>
     </section>
+    <div v-if="selectedTopic" class="topic-dialog-backdrop" role="presentation" @click.self="closeTopicDetails">
+      <section class="topic-dialog" role="dialog" aria-modal="true" aria-labelledby="topic-dialog-title">
+        <div class="topic-dialog-heading"><div><p class="eyebrow">TOPIC DETAIL</p><h2 id="topic-dialog-title">{{ selectedTopic.title }}</h2></div><button class="dialog-close" type="button" aria-label="关闭主题详情" @click="closeTopicDetails">×</button></div>
+        <dl class="topic-detail-grid"><div><dt>本地 ID</dt><dd>{{ selectedTopic.id }}</dd></div><div><dt>来源 ID</dt><dd>{{ selectedTopic.external_id }}</dd></div><div><dt>作者</dt><dd>{{ selectedTopic.author_id }}</dd></div><div><dt>状态</dt><dd>{{ selectedTopic.status }}</dd></div><div><dt>更新时间</dt><dd>{{ new Date(selectedTopic.updated_at).toLocaleString() }}</dd></div><div v-if="selectedTopic.last_error" class="topic-detail-error"><dt>最近错误</dt><dd>{{ selectedTopic.last_error }}</dd></div></dl>
+        <div v-if="!readingFullTopic" class="topic-content-section"><div class="topic-content-heading"><h3>正文内容预览</h3><span>前 {{ selectedTopicContents.length }} 条 / 共 {{ selectedTopicContentTotal }} 条</span></div><div v-if="topicDetailsLoading" class="topic-content-empty">正在读取正文…</div><div v-else-if="topicDetailsError" class="topic-content-empty error">{{ topicDetailsError }}</div><div v-else-if="selectedTopicContents.length === 0" class="topic-content-empty">该主题暂无已保存的 PageContent</div><div v-else class="topic-content-list"><article v-for="content in selectedTopicContents" :key="content.uid"><header><b>{{ content.uid }}</b><span>第 {{ content.page_no }} 页 · {{ content.floor }} 楼</span></header><p>{{ content.text }}</p></article></div></div>
+        <div v-else class="full-topic-reader"><div class="topic-content-heading"><h3>完整内容</h3><button class="text-button" type="button" @click="showTopicPreview">返回预览</button></div><div v-if="fullTopicLoading" class="topic-content-empty">正在组合完整正文…</div><div v-else-if="fullTopicError" class="topic-content-empty error">{{ fullTopicError }}</div><div v-else-if="!fullTopicText" class="topic-content-empty">该主题暂无正文</div><article v-else>{{ fullTopicText }}</article></div>
+        <div class="topic-dialog-actions"><button class="secondary-button" type="button" @click="closeTopicDetails">关闭</button><button v-if="!readingFullTopic" class="primary-button" type="button" :disabled="topicDetailsLoading || selectedTopicContentTotal === 0" @click="readFullTopic">阅读完整内容</button></div>
+      </section>
+    </div>
   </main>
 </template>

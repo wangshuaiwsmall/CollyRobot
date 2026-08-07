@@ -28,7 +28,7 @@ if errorlevel 1 goto :copy_error
 echo [WebHost] Building Go executable...
 if not exist "%OUTPUT_DIR%\" mkdir "%OUTPUT_DIR%"
 pushd "%WEBHOST_DIR%"
-go build -trimpath -o "%OUTPUT_DIR%\collyrobot-webhost.exe" .
+go build -buildvcs=false -trimpath -o "%OUTPUT_DIR%\collyrobot-webhost.exe" .
 if errorlevel 1 goto :go_error
 popd
 

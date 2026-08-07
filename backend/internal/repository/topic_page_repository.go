@@ -6,11 +6,10 @@ import (
 	"collyrobot/backend/internal/domain"
 )
 
-// TopicPageRepository 保存抓取过程中的分页临时内容。
-// 它与 TopicRepository 分离，使主题调度状态和大文本缓存可以独立演进。
+// TopicPageRepository 按 Topic + UID 保存稳定的正文片段。
 type TopicPageRepository interface {
-	// LoadPages 返回已经持久化的页面。Fetcher 使用它跳过断点前已完成的请求。
-	LoadPages(context.Context, int64) (map[int][]domain.PageContent, error)
-	// SavePage 幂等保存单页解析结果；页面抓取成功后立即调用，不等待整个主题完成。
-	SavePage(context.Context, int64, int, []domain.PageContent) error
+	// PrepareFetch 在重新拉取模式下删除 Topic 的全部旧正文，其他模式不修改数据。
+	PrepareFetch(context.Context, int64, domain.FetchMode) error
+	// SaveContents 按模式保存当前抓到的正文；UID 在同一 Topic 内唯一。
+	SaveContents(context.Context, int64, domain.FetchMode, []domain.PageContent) error
 }

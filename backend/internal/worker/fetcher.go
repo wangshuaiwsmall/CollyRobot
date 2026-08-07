@@ -13,14 +13,14 @@ var ErrForumRulesNotImplemented = errors.New("forum topic rules are not implemen
 // TopicFetcher 封装单个主题的抓取流程。
 // syncConcurrency 是该主题内部允许的最大页面请求数，不等于全局 Worker 数量。
 type TopicFetcher interface {
-	Fetch(context.Context, domain.Topic, int) error
+	Fetch(context.Context, domain.Topic, int, domain.FetchMode) error
 }
 
 // ForumFetcherStub 保留给轻量测试或未接入 Colly 编排器的场景。
 // 应用运行时使用 CollyForumFetcher，具体论坛规则由 ForumPageRulesStub 代替。
 type ForumFetcherStub struct{}
 
-func (ForumFetcherStub) Fetch(_ context.Context, _ domain.Topic, _ int) error {
+func (ForumFetcherStub) Fetch(_ context.Context, _ domain.Topic, _ int, _ domain.FetchMode) error {
 	return ErrForumRulesNotImplemented
 }
 
