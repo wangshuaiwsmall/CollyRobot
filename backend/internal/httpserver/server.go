@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -388,6 +389,15 @@ func (s *Server) fullTopicContent(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "topic id must be a positive integer"})
 		return
 	}
+	var title string
+	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT title FROM topics WHERE id = ?`, topicID).Scan(&title); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "topic not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	rows, err := s.db.QueryContext(c.Request.Context(), `
 		SELECT text FROM topic_contents
 		WHERE topic_id = ?
@@ -410,7 +420,7 @@ func (s *Server) fullTopicContent(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"topic_id": topicID, "content_count": len(parts), "text": strings.Join(parts, "\n\n")})
+	c.JSON(http.StatusOK, gin.H{"topic_id": topicID, "title": title, "content_count": len(parts), "text": strings.Join(parts, "\n\n")})
 }
 
 // schedulerStatus 返回并发上限、Worker 数量及累计处理统计。

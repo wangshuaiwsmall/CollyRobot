@@ -112,10 +112,6 @@ const selectedTopicContents = ref<PageContent[]>([])
 const selectedTopicContentTotal = ref(0)
 const topicDetailsLoading = ref(false)
 const topicDetailsError = ref('')
-const fullTopicText = ref('')
-const fullTopicLoading = ref(false)
-const fullTopicError = ref('')
-const readingFullTopic = ref(false)
 const fetchMode = ref<FetchMode>('incremental')
 let logRefreshTimer: number | undefined
 let statusRefreshTimer: number | undefined
@@ -171,9 +167,6 @@ async function viewTopic(topic: Topic) {
   selectedTopicContents.value = []
   selectedTopicContentTotal.value = 0
   topicDetailsError.value = ''
-  readingFullTopic.value = false
-  fullTopicText.value = ''
-  fullTopicError.value = ''
   topicDetailsLoading.value = true
   try {
     const result = await request<{ topic_id: number; contents: PageContent[]; total: number }>(`/api/topics/${topic.id}/contents`)
@@ -187,25 +180,9 @@ async function viewTopic(topic: Topic) {
   }
 }
 
-async function readFullTopic() {
+function readFullTopic() {
   if (!selectedTopic.value) return
-  readingFullTopic.value = true
-  fullTopicText.value = ''
-  fullTopicError.value = ''
-  fullTopicLoading.value = true
-  try {
-    const result = await request<{ topic_id: number; content_count: number; text: string }>(`/api/topics/${selectedTopic.value.id}/contents/full`)
-    fullTopicText.value = result.text
-  } catch (reason) {
-    fullTopicError.value = reason instanceof Error ? reason.message : '读取完整内容失败'
-    logger.error('读取完整主题正文失败', { topicId: selectedTopic.value.id, reason })
-  } finally {
-    fullTopicLoading.value = false
-  }
-}
-
-function showTopicPreview() {
-  readingFullTopic.value = false
+  window.open(`/reader/${selectedTopic.value.id}`, '_blank', 'noopener,noreferrer')
 }
 
 function closeTopicDetails() {
@@ -213,9 +190,6 @@ function closeTopicDetails() {
   selectedTopicContents.value = []
   selectedTopicContentTotal.value = 0
   topicDetailsError.value = ''
-  readingFullTopic.value = false
-  fullTopicText.value = ''
-  fullTopicError.value = ''
 }
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
@@ -610,9 +584,8 @@ onUnmounted(() => {
       <section class="topic-dialog" role="dialog" aria-modal="true" aria-labelledby="topic-dialog-title">
         <div class="topic-dialog-heading"><div><p class="eyebrow">TOPIC DETAIL</p><h2 id="topic-dialog-title">{{ selectedTopic.title }}</h2></div><button class="dialog-close" type="button" aria-label="关闭主题详情" @click="closeTopicDetails">×</button></div>
         <dl class="topic-detail-grid"><div><dt>本地 ID</dt><dd>{{ selectedTopic.id }}</dd></div><div><dt>来源 ID</dt><dd>{{ selectedTopic.external_id }}</dd></div><div><dt>作者</dt><dd>{{ selectedTopic.author_id }}</dd></div><div><dt>状态</dt><dd>{{ selectedTopic.status }}</dd></div><div><dt>更新时间</dt><dd>{{ new Date(selectedTopic.updated_at).toLocaleString() }}</dd></div><div v-if="selectedTopic.last_error" class="topic-detail-error"><dt>最近错误</dt><dd>{{ selectedTopic.last_error }}</dd></div></dl>
-        <div v-if="!readingFullTopic" class="topic-content-section"><div class="topic-content-heading"><h3>正文内容预览</h3><span>前 {{ selectedTopicContents.length }} 条 / 共 {{ selectedTopicContentTotal }} 条</span></div><div v-if="topicDetailsLoading" class="topic-content-empty">正在读取正文…</div><div v-else-if="topicDetailsError" class="topic-content-empty error">{{ topicDetailsError }}</div><div v-else-if="selectedTopicContents.length === 0" class="topic-content-empty">该主题暂无已保存的 PageContent</div><div v-else class="topic-content-list"><article v-for="content in selectedTopicContents" :key="content.uid"><header><b>{{ content.uid }}</b><span>第 {{ content.page_no }} 页 · {{ content.floor }} 楼</span></header><p>{{ content.text }}</p></article></div></div>
-        <div v-else class="full-topic-reader"><div class="topic-content-heading"><h3>完整内容</h3><button class="text-button" type="button" @click="showTopicPreview">返回预览</button></div><div v-if="fullTopicLoading" class="topic-content-empty">正在组合完整正文…</div><div v-else-if="fullTopicError" class="topic-content-empty error">{{ fullTopicError }}</div><div v-else-if="!fullTopicText" class="topic-content-empty">该主题暂无正文</div><article v-else>{{ fullTopicText }}</article></div>
-        <div class="topic-dialog-actions"><button class="secondary-button" type="button" @click="closeTopicDetails">关闭</button><button v-if="!readingFullTopic" class="primary-button" type="button" :disabled="topicDetailsLoading || selectedTopicContentTotal === 0" @click="readFullTopic">阅读完整内容</button></div>
+        <div class="topic-content-section"><div class="topic-content-heading"><h3>正文内容预览</h3><span>前 {{ selectedTopicContents.length }} 条 / 共 {{ selectedTopicContentTotal }} 条</span></div><div v-if="topicDetailsLoading" class="topic-content-empty">正在读取正文…</div><div v-else-if="topicDetailsError" class="topic-content-empty error">{{ topicDetailsError }}</div><div v-else-if="selectedTopicContents.length === 0" class="topic-content-empty">该主题暂无已保存的 PageContent</div><div v-else class="topic-content-list"><article v-for="content in selectedTopicContents" :key="content.uid"><header><b>{{ content.uid }}</b><span>第 {{ content.page_no }} 页 · {{ content.floor }} 楼</span></header><p>{{ content.text }}</p></article></div></div>
+        <div class="topic-dialog-actions"><button class="secondary-button" type="button" @click="closeTopicDetails">关闭</button><button class="primary-button" type="button" :disabled="topicDetailsLoading || selectedTopicContentTotal === 0" @click="readFullTopic">阅读完整内容</button></div>
       </section>
     </div>
   </main>
