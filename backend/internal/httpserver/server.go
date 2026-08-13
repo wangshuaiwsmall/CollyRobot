@@ -2,7 +2,6 @@ package httpserver
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -16,6 +15,7 @@ import (
 	"collyrobot/backend/internal/domain"
 	applogger "collyrobot/backend/internal/logger"
 	"collyrobot/backend/internal/proxyconfig"
+	"collyrobot/backend/internal/repository"
 	"collyrobot/backend/internal/scheduler"
 	"github.com/gin-gonic/gin"
 )
@@ -23,7 +23,7 @@ import (
 // Server 保存 HTTP Handler 所需的应用依赖，不在请求处理中创建数据库或调度器。
 type Server struct {
 	config         config.Config
-	db             *sql.DB
+	store          repository.DataStore
 	scheduler      *scheduler.Scheduler
 	logs           *applogger.Module
 	frontendLogger *log.Logger
@@ -31,9 +31,9 @@ type Server struct {
 }
 
 // New 创建 Gin 路由并注册所有管理接口。
-func New(cfg config.Config, db *sql.DB, dispatcher *scheduler.Scheduler, logs *applogger.Module, proxyManagers ...*proxyconfig.Manager) *gin.Engine {
+func New(cfg config.Config, store repository.DataStore, dispatcher *scheduler.Scheduler, logs *applogger.Module, proxyManagers ...*proxyconfig.Manager) *gin.Engine {
 	proxyManager := firstProxyManager(proxyManagers)
-	s := &Server{config: cfg, db: db, scheduler: dispatcher, logs: logs, proxy: proxyManager}
+	s := &Server{config: cfg, store: store, scheduler: dispatcher, logs: logs, proxy: proxyManager}
 	var accessOutput io.Writer = gin.DefaultWriter
 	var recoveryOutput io.Writer = gin.DefaultErrorWriter
 	if logs != nil {
@@ -246,12 +246,6 @@ func (s *Server) cancelIndex(c *gin.Context) {
 	c.JSON(http.StatusOK, s.scheduler.Status())
 }
 
-type topicCounts struct {
-	Waiting int `json:"waiting"`
-	Done    int `json:"done"`
-	Failed  int `json:"failed"`
-}
-
 // listTopics 只返回指定状态的当前页，并附带各状态总数，避免大量 Topic 一次传给浏览器。
 func (s *Server) listTopics(c *gin.Context) {
 	status := domain.TopicStatus(strings.ToLower(strings.TrimSpace(c.DefaultQuery("status", string(domain.TopicWaiting)))))
@@ -269,72 +263,12 @@ func (s *Server) listTopics(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "page_size must be between 1 and 100"})
 		return
 	}
-	counts := topicCounts{}
-	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT status, COUNT(*) FROM topics GROUP BY status`)
+	result, err := s.store.ListTopicPage(c.Request.Context(), status, page, pageSize)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	for rows.Next() {
-		var rowStatus domain.TopicStatus
-		var count int
-		if err := rows.Scan(&rowStatus, &count); err != nil {
-			rows.Close()
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		switch rowStatus {
-		case domain.TopicDone:
-			counts.Done = count
-		case domain.TopicFailed:
-			counts.Failed = count
-		default:
-			counts.Waiting += count
-		}
-	}
-	if err := rows.Close(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	total := counts.Waiting
-	if status == domain.TopicDone {
-		total = counts.Done
-	} else if status == domain.TopicFailed {
-		total = counts.Failed
-	}
-	totalPages := max(1, (total+pageSize-1)/pageSize)
-	if page > totalPages {
-		page = totalPages
-	}
-	topicRows, err := s.db.QueryContext(c.Request.Context(), `
-		SELECT id, external_id, title, author_id, url, status, last_error, created_at, updated_at
-		FROM topics WHERE status = ? ORDER BY id LIMIT ? OFFSET ?`, status, pageSize, (page-1)*pageSize)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	defer topicRows.Close()
-	items := make([]domain.Topic, 0, pageSize)
-	for topicRows.Next() {
-		var topic domain.Topic
-		var createdAt, updatedAt int64
-		if err := topicRows.Scan(&topic.ID, &topic.ExternalID, &topic.Title, &topic.AuthorID, &topic.URL,
-			&topic.Status, &topic.LastError, &createdAt, &updatedAt); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		topic.CreatedAt = time.Unix(createdAt, 0)
-		topic.UpdatedAt = time.Unix(updatedAt, 0)
-		items = append(items, topic)
-	}
-	if err := topicRows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"items": items, "counts": counts, "page": page, "page_size": pageSize,
-		"total": total, "total_pages": totalPages,
-	})
+	c.JSON(http.StatusOK, result)
 }
 
 const topicContentPreviewLimit = 20
@@ -346,40 +280,13 @@ func (s *Server) topicContents(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "topic id must be a positive integer"})
 		return
 	}
-	var total int
-	if err := s.db.QueryRowContext(c.Request.Context(),
-		`SELECT COUNT(*) FROM topic_contents WHERE topic_id = ?`, topicID).Scan(&total); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	rows, err := s.db.QueryContext(c.Request.Context(), `
-		SELECT uid, page_no, floor, text
-		FROM topic_contents
-		WHERE topic_id = ?
-		ORDER BY page_no, floor, uid
-		LIMIT ?`, topicID, topicContentPreviewLimit)
+	preview, err := s.store.PreviewContents(c.Request.Context(), topicID, topicContentPreviewLimit)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	defer rows.Close()
-	contents := make([]domain.PageContent, 0)
-	for rows.Next() {
-		var content domain.PageContent
-		if err := rows.Scan(&content.UID, &content.PageNo, &content.Floor, &content.Text); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		contents = append(contents, content)
-	}
-	if err := rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"topic_id": topicID, "contents": contents, "total": total,
-		"displayed": len(contents), "truncated": total > len(contents),
-	})
+	c.JSON(http.StatusOK, gin.H{"topic_id": topicID, "contents": preview.Contents, "total": preview.Total,
+		"displayed": preview.Displayed, "truncated": preview.Truncated})
 }
 
 // fullTopicContent 按页码、楼层和 UID 排序后拼接全部 Text，供阅读完整内容。
@@ -389,38 +296,16 @@ func (s *Server) fullTopicContent(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "topic id must be a positive integer"})
 		return
 	}
-	var title string
-	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT title FROM topics WHERE id = ?`, topicID).Scan(&title); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+	content, err := s.store.FullContent(c.Request.Context(), topicID)
+	if err != nil {
+		if errors.Is(err, repository.ErrTopicNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "topic not found"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	rows, err := s.db.QueryContext(c.Request.Context(), `
-		SELECT text FROM topic_contents
-		WHERE topic_id = ?
-		ORDER BY page_no, floor, uid`, topicID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	defer rows.Close()
-	parts := make([]string, 0)
-	for rows.Next() {
-		var value string
-		if err := rows.Scan(&value); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		parts = append(parts, value)
-	}
-	if err := rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"topic_id": topicID, "title": title, "content_count": len(parts), "text": strings.Join(parts, "\n\n")})
+	c.JSON(http.StatusOK, gin.H{"topic_id": topicID, "title": content.Title, "content_count": content.ContentCount, "text": content.Text})
 }
 
 // schedulerStatus 返回并发上限、Worker 数量及累计处理统计。
@@ -449,7 +334,7 @@ func (s *Server) hello(c *gin.Context) {
 
 // health 通过实际 Ping 数据库判断服务是否具备基本工作条件。
 func (s *Server) health(c *gin.Context) {
-	if err := s.db.PingContext(c.Request.Context()); err != nil {
+	if err := s.store.Ping(c.Request.Context()); err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unhealthy"})
 		return
 	}

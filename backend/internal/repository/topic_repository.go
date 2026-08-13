@@ -9,6 +9,7 @@ import (
 
 // ErrNoWaitingTopic 表示没有可由用户指令加入内存队列的等待主题。
 var ErrNoWaitingTopic = errors.New("no waiting topic")
+var ErrTopicNotFound = errors.New("topic not found")
 
 // TopicRepository 定义调度器和索引器所需的最小持久化能力。
 // 业务层只依赖该接口，因此以后从 SQLite 切换到 MongoDB 时无需修改调度和抓取逻辑。

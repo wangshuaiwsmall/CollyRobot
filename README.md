@@ -143,3 +143,30 @@ internal/
 主题正文抓取使用 Colly 编排：先同步访问“只看作者”首页以确认总页数，再创建异步 Collector，并将 `sync_concurrency` 映射为 Colly `LimitRule.Parallelism`。分页响应携带页码上下文，全部完成后按页码排序并调用持久化规则。具体论坛的 URL 拼接、HTML 选择器和小说存储规则位于 `worker/forum_rules_stub.go`，尚待按目标论坛实现。
 
 `PageContent.UID` 优先由论坛数据源提供；数据源无法提供时，抓取器使用 `Floor + PageNo` 生成 UID。SQLite 的 `topic_contents` 以 `(topic_id, uid)` 为主键，并保存正文 MD5。抓取支持三种模式：`incremental` 只插入新 UID；`validate` 同样插入新 UID，并在相同 UID 的正文 MD5 改变时覆盖 Text；`reload` 在网络抓取开始前删除该 Topic 的全部旧正文，然后重新写入本次结果。未传 `mode` 时默认使用 `incremental`。
+
+## 存储后端
+
+默认使用 SQLite，现也支持 MongoDB。两种后端提供相同的 Topic、正文、分页查询、代理设置和健康检查能力。
+
+SQLite：
+
+```powershell
+backend\bin\collyrobot.exe -storage sqlite -database .\data\collyrobot.db
+```
+
+MongoDB：
+
+```powershell
+backend\bin\collyrobot.exe -storage mongodb -mongodb-uri mongodb://127.0.0.1:27017 -mongodb-database collyrobot
+```
+
+也可以使用环境变量：
+
+- `STORAGE_DRIVER`：`sqlite`（默认）或 `mongodb`
+- `DATABASE_PATH`：SQLite 文件路径
+- `MONGODB_URI`：MongoDB URI，默认 `mongodb://127.0.0.1:27017`
+- `MONGODB_DATABASE`：MongoDB 数据库名，默认 `collyrobot`
+
+MongoDB 会自动创建 `topics`、`topic_contents`、`app_settings` 和 `counters` 集合及所需索引。其中 `(topic_id, uid)` 是正文唯一键，行为与 SQLite 主键一致。
+
+存储驱动切换不会自动迁移已有数据；SQLite 与 MongoDB 数据彼此独立。需要保留历史数据时，应在切换前单独执行数据迁移。

@@ -2,14 +2,13 @@ package proxyconfig
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 const (
@@ -32,7 +31,12 @@ type Status struct {
 
 type Manager struct {
 	config atomic.Value
-	db     *sql.DB
+	store  SettingStore
+}
+
+type SettingStore interface {
+	LoadSetting(context.Context, string) (string, bool, error)
+	SaveSetting(context.Context, string, string, time.Time) error
 }
 
 func New(initial Config) (*Manager, error) {
@@ -44,17 +48,17 @@ func New(initial Config) (*Manager, error) {
 	return manager, nil
 }
 
-func NewPersistent(db *sql.DB, fallback Config) (*Manager, error) {
-	manager := &Manager{db: db}
+func NewPersistent(store SettingStore, fallback Config) (*Manager, error) {
+	manager := &Manager{store: store}
 	manager.config.Store(Config{Mode: ModeDirect})
-	var raw string
-	err := db.QueryRow(`SELECT value FROM app_settings WHERE key = 'proxy'`).Scan(&raw)
-	if err == nil {
+	raw, found, err := store.LoadSetting(context.Background(), "proxy")
+	if err != nil {
+		return nil, fmt.Errorf("load proxy configuration: %w", err)
+	}
+	if found {
 		if err := json.Unmarshal([]byte(raw), &fallback); err != nil {
 			return nil, fmt.Errorf("decode saved proxy configuration: %w", err)
 		}
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("load proxy configuration: %w", err)
 	}
 	normalized, err := normalize(fallback, false)
 	if err != nil {
@@ -82,14 +86,12 @@ func (m *Manager) UpdatePersistent(ctx context.Context, next Config) error {
 	if err != nil {
 		return err
 	}
-	if m.db != nil {
+	if m.store != nil {
 		raw, err := json.Marshal(normalized)
 		if err != nil {
 			return err
 		}
-		_, err = m.db.ExecContext(ctx, `
-			INSERT INTO app_settings(key, value, updated_at) VALUES ('proxy', ?, unixepoch())
-			ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`, string(raw))
+		err = m.store.SaveSetting(ctx, "proxy", string(raw), time.Now().UTC())
 		if err != nil {
 			return fmt.Errorf("save proxy configuration: %w", err)
 		}

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"collyrobot/backend/internal/domain"
@@ -46,6 +47,14 @@ func OpenSQLite(path string) (*sql.DB, error) {
 
 // NewTopicStore 使用已初始化的共享连接池创建主题仓库。
 func NewTopicStore(db *sql.DB) *TopicStore { return &TopicStore{db: db} }
+
+func OpenSQLiteStore(path string) (*TopicStore, error) {
+	db, err := OpenSQLite(path)
+	if err != nil {
+		return nil, err
+	}
+	return NewTopicStore(db), nil
+}
 
 // migrate 创建当前版本需要的数据表和查询索引。
 // IF NOT EXISTS 让该操作可在每次启动时安全重复执行；后续复杂升级应迁移到版本化 migration。
@@ -264,6 +273,124 @@ func (s *TopicStore) SaveContents(ctx context.Context, topicID int64, mode domai
 	return tx.Commit()
 }
 
+func (s *TopicStore) ListTopicPage(ctx context.Context, status domain.TopicStatus, page, pageSize int) (repository.TopicPage, error) {
+	counts := repository.TopicCounts{}
+	rows, err := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM topics GROUP BY status`)
+	if err != nil {
+		return repository.TopicPage{}, err
+	}
+	for rows.Next() {
+		var rowStatus domain.TopicStatus
+		var count int
+		if err := rows.Scan(&rowStatus, &count); err != nil {
+			rows.Close()
+			return repository.TopicPage{}, err
+		}
+		switch rowStatus {
+		case domain.TopicDone:
+			counts.Done = count
+		case domain.TopicFailed:
+			counts.Failed = count
+		default:
+			counts.Waiting += count
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return repository.TopicPage{}, err
+	}
+	total := counts.Waiting
+	if status == domain.TopicDone {
+		total = counts.Done
+	} else if status == domain.TopicFailed {
+		total = counts.Failed
+	}
+	totalPages := max(1, (total+pageSize-1)/pageSize)
+	page = min(max(1, page), totalPages)
+	topicRows, err := s.db.QueryContext(ctx, `
+		SELECT id, external_id, title, author_id, url, status, last_error, created_at, updated_at
+		FROM topics WHERE status = ? ORDER BY id LIMIT ? OFFSET ?`, status, pageSize, (page-1)*pageSize)
+	if err != nil {
+		return repository.TopicPage{}, err
+	}
+	defer topicRows.Close()
+	items := make([]domain.Topic, 0, pageSize)
+	for topicRows.Next() {
+		topic, err := scanTopic(topicRows)
+		if err != nil {
+			return repository.TopicPage{}, err
+		}
+		items = append(items, topic)
+	}
+	return repository.TopicPage{Items: items, Counts: counts, Page: page, PageSize: pageSize, Total: total, TotalPages: totalPages}, topicRows.Err()
+}
+
+func (s *TopicStore) PreviewContents(ctx context.Context, topicID int64, limit int) (repository.ContentPreview, error) {
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM topic_contents WHERE topic_id = ?`, topicID).Scan(&total); err != nil {
+		return repository.ContentPreview{}, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT uid, page_no, floor, text FROM topic_contents
+		WHERE topic_id = ? ORDER BY page_no, floor, uid LIMIT ?`, topicID, limit)
+	if err != nil {
+		return repository.ContentPreview{}, err
+	}
+	defer rows.Close()
+	contents := make([]domain.PageContent, 0, min(total, limit))
+	for rows.Next() {
+		var content domain.PageContent
+		if err := rows.Scan(&content.UID, &content.PageNo, &content.Floor, &content.Text); err != nil {
+			return repository.ContentPreview{}, err
+		}
+		contents = append(contents, content)
+	}
+	return repository.ContentPreview{Contents: contents, Total: total, Displayed: len(contents), Truncated: total > len(contents)}, rows.Err()
+}
+
+func (s *TopicStore) FullContent(ctx context.Context, topicID int64) (repository.FullTopicContent, error) {
+	var title string
+	if err := s.db.QueryRowContext(ctx, `SELECT title FROM topics WHERE id = ?`, topicID).Scan(&title); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return repository.FullTopicContent{}, repository.ErrTopicNotFound
+		}
+		return repository.FullTopicContent{}, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT text FROM topic_contents WHERE topic_id = ? ORDER BY page_no, floor, uid`, topicID)
+	if err != nil {
+		return repository.FullTopicContent{}, err
+	}
+	defer rows.Close()
+	parts := make([]string, 0)
+	for rows.Next() {
+		var text string
+		if err := rows.Scan(&text); err != nil {
+			return repository.FullTopicContent{}, err
+		}
+		parts = append(parts, text)
+	}
+	return repository.FullTopicContent{Title: title, ContentCount: len(parts), Text: strings.Join(parts, "\n\n")}, rows.Err()
+}
+
+func (s *TopicStore) LoadSetting(ctx context.Context, key string) (string, bool, error) {
+	var value string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM app_settings WHERE key = ?`, key).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	return value, err == nil, err
+}
+
+func (s *TopicStore) SaveSetting(ctx context.Context, key, value string, updatedAt time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO app_settings(key, value, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`, key, value, updatedAt.Unix())
+	return err
+}
+
+func (s *TopicStore) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
+
+func (s *TopicStore) Close(_ context.Context) error { return s.db.Close() }
+
 // MarkDone 清空历史错误并把主题置为完成状态。
 func (s *TopicStore) MarkDone(ctx context.Context, id int64) error {
 	return s.setResult(ctx, id, domain.TopicDone, "")
@@ -310,3 +437,5 @@ func scanTopic(row rowScanner) (domain.Topic, error) {
 	topic.UpdatedAt = time.Unix(updatedAt, 0)
 	return topic, nil
 }
+
+var _ repository.DataStore = (*TopicStore)(nil)

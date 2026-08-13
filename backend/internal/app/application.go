@@ -4,11 +4,12 @@ package app
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
+	"time"
 
 	"collyrobot/backend/internal/config"
 	"collyrobot/backend/internal/crawler"
@@ -16,6 +17,7 @@ import (
 	"collyrobot/backend/internal/indexer"
 	applogger "collyrobot/backend/internal/logger"
 	"collyrobot/backend/internal/proxyconfig"
+	"collyrobot/backend/internal/repository"
 	"collyrobot/backend/internal/scheduler"
 	"collyrobot/backend/internal/store"
 	"collyrobot/backend/internal/worker"
@@ -27,7 +29,7 @@ type Application struct {
 	Handler   http.Handler
 	Scheduler *scheduler.Scheduler
 	Logs      *applogger.Module
-	db        *sql.DB
+	store     repository.DataStore
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -38,16 +40,15 @@ func New(cfg config.Config, console io.Writer) (*Application, error) {
 	if err != nil {
 		return nil, fmt.Errorf("initialize logger: %w", err)
 	}
-	db, err := store.OpenSQLite(cfg.DatabasePath)
+	dataStore, err := openDataStore(cfg)
 	if err != nil {
 		_ = logs.Close()
-		return nil, fmt.Errorf("open database: %w", err)
+		return nil, fmt.Errorf("open %s storage: %w", cfg.StorageDriver, err)
 	}
 
-	topics := store.NewTopicStore(db)
-	proxyManager, err := proxyconfig.NewPersistent(db, proxyconfig.Config{Mode: cfg.ProxyMode, URL: cfg.ProxyURL})
+	proxyManager, err := proxyconfig.NewPersistent(dataStore, proxyconfig.Config{Mode: cfg.ProxyMode, URL: cfg.ProxyURL})
 	if err != nil {
-		_ = db.Close()
+		_ = dataStore.Close(context.Background())
 		_ = logs.Close()
 		return nil, fmt.Errorf("initialize proxy configuration: %w", err)
 	}
@@ -63,26 +64,26 @@ func New(cfg config.Config, console io.Writer) (*Application, error) {
 		// 索引器使用同步 Colly 递归翻页；具体论坛列表规则暂由 Stub 占位。
 		indexCrawler = indexer.NewCollyForumIndexCrawler(crawlerService, indexer.ForumIndexRulesStub{})
 		// 抓取编排器已接入 Colly；具体 BBS 的 URL/页面规则暂由 Stub 占位。
-		forumFetcher = worker.NewCollyForumFetcher(crawlerService, worker.ForumPageRulesStub{}, topics)
+		forumFetcher = worker.NewCollyForumFetcher(crawlerService, worker.ForumPageRulesStub{}, dataStore)
 	}
-	indexBuilder := indexer.New(indexCrawler, topics)
-	dispatcher := scheduler.New(topics, forumFetcher, indexBuilder, logs.Backend, scheduler.Limits{
+	indexBuilder := indexer.New(indexCrawler, dataStore)
+	dispatcher := scheduler.New(dataStore, forumFetcher, indexBuilder, logs.Backend, scheduler.Limits{
 		Workers: cfg.WorkerLimit, SyncConcurrency: cfg.SyncLimit,
 	})
 	dispatcher.SetWorkflowLoggers(logs.Indexer, logs.Crawler)
 	// 服务启动时让调度器默认待命。此操作只创建空闲 Worker，不会加载 waiting Topic，
 	// 因而不会因服务重启产生意外抓取；实际入队仍由管理 API 显式控制。
 	if err := dispatcher.Start(context.Background()); err != nil {
-		_ = db.Close()
+		_ = dataStore.Close(context.Background())
 		_ = logs.Close()
 		return nil, fmt.Errorf("start scheduler: %w", err)
 	}
 
 	return &Application{
-		Handler:   httpserver.New(cfg, db, dispatcher, logs, proxyManager),
+		Handler:   httpserver.New(cfg, dataStore, dispatcher, logs, proxyManager),
 		Scheduler: dispatcher,
 		Logs:      logs,
-		db:        db,
+		store:     dataStore,
 	}, nil
 }
 
@@ -90,7 +91,7 @@ func New(cfg config.Config, console io.Writer) (*Application, error) {
 func (a *Application) Close() error {
 	a.closeOnce.Do(func() {
 		a.Scheduler.Stop()
-		dbErr := a.db.Close()
+		dbErr := a.store.Close(context.Background())
 		logErr := a.Logs.Close()
 		if dbErr != nil {
 			a.closeErr = dbErr
@@ -99,4 +100,17 @@ func (a *Application) Close() error {
 		a.closeErr = logErr
 	})
 	return a.closeErr
+}
+
+func openDataStore(cfg config.Config) (repository.DataStore, error) {
+	switch strings.ToLower(strings.TrimSpace(cfg.StorageDriver)) {
+	case "", "sqlite":
+		return store.OpenSQLiteStore(cfg.DatabasePath)
+	case "mongodb", "mongo":
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return store.OpenMongoStore(ctx, cfg.MongoDBURI, cfg.MongoDBName)
+	default:
+		return nil, fmt.Errorf("unsupported storage driver %q", cfg.StorageDriver)
+	}
 }
